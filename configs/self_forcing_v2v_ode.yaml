@@ -1,0 +1,62 @@
+# Bernini 1.3B v2v 因果学生 ODE 初始化 (CausVid 式回归)
+# 从 base 因果生成器(16通道)起步, Trainer 扩通道为 32; 回归 Bernini teacher 离线生成的 v2v ODE 轨迹
+
+trainer: ode
+distribution_loss: ode
+
+# base 因果生成器(16 通道, 由 Bernini t2v 因果权重提供); 模型初始化时加载, 之后扩通道
+generator_ckpt: checkpoints/bernini_causal_base.pt
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+# ---- v2v ----
+v2v: true
+cond_channels: 16
+
+# ---- ODE 数据(LMDB) ----
+# 需离线用 Bernini teacher 在 ReCo-Data 源视频条件下采样 ODE 轨迹, 与 'latents' 并存 'cond_latent'
+data_path: ode_data/bernini_v2v_ode_lmdb
+max_pair: 100000000
+
+# ---- 4 步因果 ----
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_train_timestep: 1000
+timestep_shift: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+causal: true
+num_frame_per_block: 3
+num_training_frames: 21
+
+# ---- 优化 ----
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+total_batch_size: 8
+log_iters: 200
+gc_interval: 100
+gradient_checkpointing: true
+seed: 0
+
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+model_kwargs:
+  timestep_shift: 3.0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT

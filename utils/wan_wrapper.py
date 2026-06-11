@@ -144,6 +144,36 @@ class WanDiffusionWrapper(torch.nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
 
+    def expand_in_channels(self, total_in_channels: int) -> None:
+        """把 patch_embedding 输入通道扩到 total_in_channels，用于 v2v 通道拼接条件注入。
+
+        原有通道权重保留，新增通道零初始化，使扩展后模型初始行为与原文本模型一致。
+        student / fake_score / real_score 需统一调用，保证三者条件接口对齐。
+        """
+        conv = self.model.patch_embedding
+        old_in = conv.in_channels
+        if old_in == total_in_channels:
+            return
+        assert total_in_channels > old_in, \
+            f"total_in_channels({total_in_channels}) 必须大于原通道数({old_in})"
+        new_conv = nn.Conv3d(
+            total_in_channels, conv.out_channels,
+            kernel_size=conv.kernel_size, stride=conv.stride,
+            padding=conv.padding,
+        ).to(device=conv.weight.device, dtype=conv.weight.dtype)
+        with torch.no_grad():
+            new_conv.weight.zero_()
+            new_conv.weight[:, :old_in].copy_(conv.weight)
+            if conv.bias is not None:
+                new_conv.bias.copy_(conv.bias)
+        self.model.patch_embedding = new_conv
+        self.model.in_dim = total_in_channels
+        if hasattr(self.model, "config") and hasattr(self.model.config, "in_dim"):
+            try:
+                self.model.config.in_dim = total_in_channels
+            except Exception:
+                pass
+
     def adding_cls_branch(self, atten_dim=1536, num_class=4, time_embed_dim=0) -> None:
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
         self._cls_pred_branch = nn.Sequential(
@@ -229,6 +259,10 @@ class WanDiffusionWrapper(torch.nn.Module):
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
+        # v2v 通道拼接条件: [B, F, C, H, W] -> [B, C, F, H, W]，作为 model 的 y 在 patch_embedding 前拼接
+        cond_latent = conditional_dict.get("cond_latent", None)
+        y = cond_latent.permute(0, 2, 1, 3, 4) if cond_latent is not None else None
+
         # [B, F] -> [B]
         if self.uniform_timestep:
             input_timestep = timestep[:, 0]
@@ -245,7 +279,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                y=y
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -274,7 +309,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        seq_len=self.seq_len,
+                        y=y
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

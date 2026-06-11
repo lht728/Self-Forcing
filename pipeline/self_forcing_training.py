@@ -57,6 +57,13 @@ class SelfForcingTrainingPipeline:
         dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
         return indices.tolist()
 
+    @staticmethod
+    def _attach_cond(base_dict, cond_latent, start, length):
+        """按当前 block 的帧区间切出对应的 v2v 源条件 latent 并注入 conditional_dict。"""
+        if cond_latent is None:
+            return base_dict
+        return {**base_dict, "cond_latent": cond_latent[:, start:start + length]}
+
     def inference_with_trajectory(
             self,
             noise: torch.Tensor,
@@ -64,6 +71,8 @@ class SelfForcingTrainingPipeline:
             return_sim_step: bool = False,
             **conditional_dict
     ) -> torch.Tensor:
+        # v2v 源条件: 整段 [B, F, C, H, W]，按 block 帧对齐切片注入(从 conditional_dict 取出避免整段误拼接)
+        cond_latent = conditional_dict.pop("cond_latent", None)
         batch_size, num_frames, num_channels, height, width = noise.shape
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
@@ -120,7 +129,8 @@ class SelfForcingTrainingPipeline:
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=initial_latent,
-                    conditional_dict=conditional_dict,
+                    conditional_dict=self._attach_cond(
+                        conditional_dict, cond_latent, current_start_frame, 1),
                     timestep=timestep * 0,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
@@ -156,7 +166,7 @@ class SelfForcingTrainingPipeline:
                     with torch.no_grad():
                         _, denoised_pred = self.generator(
                             noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
+                            conditional_dict=self._attach_cond(conditional_dict, cond_latent, current_start_frame, current_num_frames),
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
@@ -176,7 +186,7 @@ class SelfForcingTrainingPipeline:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
                                 noisy_image_or_video=noisy_input,
-                                conditional_dict=conditional_dict,
+                                conditional_dict=self._attach_cond(conditional_dict, cond_latent, current_start_frame, current_num_frames),
                                 timestep=timestep,
                                 kv_cache=self.kv_cache1,
                                 crossattn_cache=self.crossattn_cache,
@@ -185,7 +195,7 @@ class SelfForcingTrainingPipeline:
                     else:
                         _, denoised_pred = self.generator(
                             noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
+                            conditional_dict=self._attach_cond(conditional_dict, cond_latent, current_start_frame, current_num_frames),
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
@@ -208,7 +218,7 @@ class SelfForcingTrainingPipeline:
             with torch.no_grad():
                 self.generator(
                     noisy_image_or_video=denoised_pred,
-                    conditional_dict=conditional_dict,
+                    conditional_dict=self._attach_cond(conditional_dict, cond_latent, current_start_frame, current_num_frames),
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,

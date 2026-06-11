@@ -3,6 +3,7 @@ import logging
 
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.dataset import TextDataset
+from utils.dataset import V2VVideoDataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -67,6 +68,32 @@ class Trainer:
         else:
             raise ValueError("Invalid distribution matching loss")
 
+        # v2v: 把 student/fake/real 的 patch_embedding 统一扩通道(通道拼接条件注入)
+        self.v2v = getattr(config, "v2v", False)
+        if self.v2v:
+            total_in = 16 + getattr(config, "cond_channels", 16)
+            self.model.generator.expand_in_channels(total_in)
+            self.model.fake_score.expand_in_channels(total_in)
+            self.model.real_score.expand_in_channels(total_in)
+            self.condition_dropout = getattr(config, "condition_dropout", 0.0)
+
+            # 载入通道拼接 v2v teacher(短训产出): real_score 必须是 v2v 条件版, 否则 DMD 梯度无效。
+            # fake_score 同样用 teacher 权重做初始化(更稳的判别器起点)。
+            teacher_ckpt = getattr(config, "real_score_v2v_ckpt", None)
+            if teacher_ckpt:
+                t_sd = torch.load(teacher_ckpt, map_location="cpu")
+                t_sd = t_sd.get("generator", t_sd)
+                rs_missing, rs_unexpected = self.model.real_score.model.load_state_dict(t_sd, strict=False)
+                rs_missing = [m for m in rs_missing if not m.endswith(".freqs")]
+                assert not rs_missing and not rs_unexpected, \
+                    f"real_score 载入 teacher 不匹配 missing={rs_missing[:5]} unexpected={rs_unexpected[:5]}"
+                fake_ckpt = getattr(config, "fake_score_v2v_ckpt", teacher_ckpt)
+                f_sd = torch.load(fake_ckpt, map_location="cpu")
+                f_sd = f_sd.get("generator", f_sd)
+                self.model.fake_score.model.load_state_dict(f_sd, strict=False)
+                if self.is_main_process:
+                    print(f"[v2v] real_score/fake_score 已载入 teacher: {teacher_ckpt}")
+
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
 
@@ -122,6 +149,17 @@ class Trainer:
         # Step 3: Initialize the dataloader
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+        elif getattr(config, "v2v", False):
+            dataset = V2VVideoDataset(
+                config.data_path,
+                base_video_folder=config.base_video_folder,
+                num_frames=getattr(config, "num_raw_frames", 81),
+                height=config.height,
+                width=config.width,
+                prompt_key=getattr(config, "prompt_key", "instruction_final_refine"),
+                src_key=getattr(config, "src_key", "src_video"),
+                target_fps=getattr(config, "target_fps", 16),
+            )
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -239,6 +277,16 @@ class Trainer:
                 self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
+
+            # v2v: 源视频 -> VAE 编码为条件 latent，注入 cond / uncond(源在两侧都保留, CFG 只作用于文本)
+            if self.v2v:
+                src_video = batch["src_video"].to(device=self.device, dtype=self.dtype)
+                cond_latent = self.model.vae.encode_to_latent(src_video).to(self.dtype)
+                # condition dropout: 按样本概率整体置零, 防止 4 步少步生成直接拷贝源(欠编辑)
+                if self.condition_dropout > 0 and torch.rand(1).item() < self.condition_dropout:
+                    cond_latent = torch.zeros_like(cond_latent)
+                conditional_dict = {**conditional_dict, "cond_latent": cond_latent}
+                unconditional_dict = {**unconditional_dict, "cond_latent": cond_latent}
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:

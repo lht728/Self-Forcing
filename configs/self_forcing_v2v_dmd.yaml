@@ -1,0 +1,90 @@
+# Bernini 1.3B v2v-only 因果 4 步流式蒸馏 (Self-Forcing + DMD)
+# 基于 self_forcing_dmd.yaml，改为 v2v：源视频作为条件，丢弃 GT，teacher=Bernini
+
+# ---- 模型 / 初始化 ----
+generator_ckpt: checkpoints/ode_init_v2v.pt   # v2v 上做过 ODE 初始化的因果学生
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+real_name: Bernini-R-1.3B
+
+# ---- 4 步因果去噪 ----
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 3.0          # 对齐 Bernini 1.3B config 的 shift=3.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+
+# ---- 因果 / 流式结构 ----
+causal: true
+num_frame_per_block: 3
+num_training_frames: 21      # latent 帧数 (21 latent = 81 像素帧, Wan VAE 4x 时间下采样)
+
+# ---- v2v 数据 (ReCo-Data：只用 src + 指令) ----
+v2v: true
+data_path: /apdcephfs/private_huitinglu/ReCo-Data/replace/replace_data_configs.json
+# 混合多任务时改为目录: /apdcephfs/private_huitinglu/ReCo-Data
+base_video_folder: /apdcephfs/private_huitinglu/ReCo-Data
+prompt_key: instruction_final_refine
+src_key: src_video
+num_raw_frames: 81
+target_fps: 16
+height: 480
+width: 832
+load_raw_video: true         # v2v 需要 VAE 在卡上把源视频编码成条件 latent
+
+# ---- v2v 条件 / 防 copy 捷径 ----
+cond_channels: 16            # 源视频 latent 通道数(Wan VAE z_dim=16)，patch_embedding 扩为 16+16=32
+condition_dropout: 0.15      # 以一定概率丢弃源视频条件，把 CFG 蒸进单次前向，防欠编辑
+
+# ---- v2v teacher(通道拼接, 由 tools/train_v2v_teacher.py 短训产出) ----
+# real_score 必须是 v2v 条件版; fake_score 默认用同一 teacher 权重初始化
+real_score_v2v_ckpt: checkpoints/bernini_v2v_teacher.pt
+# fake_score_v2v_ckpt: checkpoints/bernini_v2v_teacher.pt
+
+# ---- 优化 ----
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+batch_size: 1
+total_batch_size: 64
+dfake_gen_update_ratio: 5
+ema_weight: 0.99
+ema_start_step: 200
+log_iters: 50
+gradient_checkpointing: true
+
+# ---- 蒸馏算法 ----
+distribution_loss: dmd
+trainer: score_distillation
+
+# ---- latent 形状 [B, F_latent, C, H_latent, W_latent] (480x832 -> 60x104, /8 空间) ----
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+model_kwargs:
+  timestep_shift: 3.0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT

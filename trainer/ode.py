@@ -60,6 +60,11 @@ class Trainer:
         assert config.distribution_loss == "ode", "Only ODE loss is supported for ODE training"
         self.model = ODERegression(config, device=self.device)
 
+        # v2v: 扩 patch_embedding 通道, 与 DMD 阶段保持一致的通道拼接条件接口
+        self.v2v = getattr(config, "v2v", False)
+        if self.v2v:
+            self.model.generator.expand_in_channels(16 + getattr(config, "cond_channels", 16))
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -102,7 +107,8 @@ class Trainer:
 
         ##############################################################################################################
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        if getattr(config, "generator_ckpt", False):
+        # v2v: base 16 通道权重已在 ODERegression.__init__ 中加载, Trainer 再扩通道, 故跳过此处重复加载
+        if getattr(config, "generator_ckpt", False) and not self.v2v:
             print(f"Loading pretrained generator from {config.generator_ckpt}")
             state_dict = torch.load(config.generator_ckpt, map_location="cpu")[
                 'generator']
@@ -145,6 +151,10 @@ class Trainer:
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
                 text_prompts=text_prompts)
+            # v2v: 注入源条件 latent(lmdb 内由 Bernini teacher 离线生成的成对源)
+            if self.v2v and "cond_latent" in batch:
+                conditional_dict["cond_latent"] = batch["cond_latent"].to(
+                    device=self.device, dtype=self.dtype)
 
         # Step 3: Train the generator
         generator_loss, log_dict = self.model.generator_loss(
