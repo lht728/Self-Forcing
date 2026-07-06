@@ -1,0 +1,63 @@
+# Stage-1 初始化方案 C: Causal ODE (Causal Forcing, 因果 AR teacher 离线采样 + ODE 回归)
+# init_method: causal_ode  →  trainer: ode
+# 前置: Stage-0 tools/train_causal_v2v_teacher.py → bernini_causal_v2v_teacher.pt
+# 采样: generate_v2v_ode_lmdb.py sample --causal_teacher --prefix_v2v
+# Stage-2 DMD 仍用双向 Bernini real_score (self_forcing_v2v_dmd.yaml)
+
+init_method: causal_ode
+ode_teacher_type: causal
+
+trainer: ode
+distribution_loss: ode
+
+generator_ckpt: checkpoints/bernini_v2v_prefix_init.pt
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+v2v: true
+
+# LMDB 由因果 teacher 采样产出(与双向 ODE LMDB 分开存)
+data_path: ode_data/bernini_v2v_causal_ode_routeb_lmdb
+max_pair: 100000000
+
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_train_timestep: 1000
+timestep_shift: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+causal: true
+num_frame_per_block: 3
+num_training_frames: 21
+
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+total_batch_size: 8
+
+log_iters: 200
+gc_interval: 100
+gradient_checkpointing: true
+seed: 0
+
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+model_kwargs:
+  timestep_shift: 3.0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT

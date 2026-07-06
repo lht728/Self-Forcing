@@ -3,7 +3,7 @@ from functools import partial
 import os
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import FullOptimStateDictConfig, FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
 from torch.distributed.fsdp.api import CPUOffload
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 
@@ -18,6 +18,34 @@ def fsdp_state_dict(model):
         checkpoint = model.state_dict()
 
     return checkpoint
+
+
+def fsdp_optim_state_dict(model, optimizer):
+    """聚合 FSDP 分片优化器状态为 rank0 全量(无损续训用)。所有 rank 必须同时调用(集合通信)。"""
+    with FSDP.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        osd = FSDP.optim_state_dict(model, optimizer)
+    return osd
+
+
+def fsdp_load_optim_state_dict(model, optimizer, full_osd):
+    """把全量优化器状态重新分片并载入当前 rank。所有 rank 必须同时调用(集合通信)。"""
+    if full_osd is None:
+        return
+    with FSDP.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        sharded_osd = FSDP.optim_state_dict_to_load(
+            model=model, optim=optimizer, optim_state_dict=full_osd
+        )
+    optimizer.load_state_dict(sharded_osd)
 
 
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):

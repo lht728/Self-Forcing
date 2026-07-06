@@ -1,0 +1,99 @@
+# Bernini 1.3B v2v 双向(不因果) 4 步 DMD 蒸馏 (Stage-2)
+# Stage-1 用 self_forcing_v2v_ode_bidir.yaml (双向 ODE 回归, 复用路线B 同一 LMDB)。
+# 与因果版 self_forcing_v2v_dmd.yaml 区别: generator 双向 + 学生用整段双向多步 rollout(无 KV cache)。
+# 因果版与本双向版互不影响, 可在不同 GPU 同时跑。
+
+# ---- 模型 / 初始化 (路线B: Bernini 原生前缀 token v2v, 16 通道, 不扩通道) ----
+# 首训指向双向 ODE Stage-1 产出; 续训指向本目录最新 checkpoint_model_XXXXXX/model.pt
+generator_ckpt: logs/bernini_v2v_ode_bidir/checkpoint_model_002000/model.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+real_name: Bernini-R-1.3B
+
+# ---- 不因果化: 双向 generator + 双向 DMD rollout ----
+generator_causal: false
+causal: false
+
+# ---- 4 步去噪 ----
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 3.0          # 对齐 Bernini 1.3B config 的 shift=3.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+
+# ---- 结构 (双向整段; num_frame_per_block 对双向 rollout 无因果含义) ----
+num_frame_per_block: 21
+num_training_frames: 21      # latent 帧数 (21 latent = 81 像素帧, Wan VAE 4x 时间下采样)
+
+# ---- v2v 数据 (ReCo-Data：只用 src + 指令) ----
+v2v: true
+data_path: /apdcephfs/private_huitinglu/ReCo-Data/replace/replace_data_configs.json
+base_video_folder: /apdcephfs/private_huitinglu/ReCo-Data
+prompt_key: instruction_final_refine
+src_key: src_video
+num_raw_frames: 81
+target_fps: 16
+height: 480
+width: 832
+load_raw_video: true         # v2v 需要 VAE 在卡上把源视频编码成条件 latent
+
+# ---- v2v 条件 / 防 copy 捷径 ----
+condition_dropout: 0.0       # ODE-first 已会跟源, 先设 0 防加重源脱离; 确认稳住、出现欠编辑再小幅上调
+
+# ---- v2v teacher (双向 Bernini 原生前缀 token v2v 权重) ----
+real_score_v2v_ckpt: checkpoints/bernini_v2v_prefix_init.pt
+# fake_score_v2v_ckpt: checkpoints/bernini_v2v_prefix_init.pt
+
+# ---- 优化 ----
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+weight_decay: 0.01
+batch_size: 1
+total_batch_size: 64
+dfake_gen_update_ratio: 5
+ema_weight: 0.99
+ema_start_step: 200
+log_iters: 50
+gc_interval: 100
+gradient_checkpointing: true
+
+# ---- 本地日志: tensorboard + CFG 记录 ----
+enable_tensorboard: true
+tensorboard_dir: logs/bernini_v2v_dmd_bidir/tensorboard
+
+# ---- 蒸馏算法 (双向 DMD) ----
+distribution_loss: bidirectional_dmd
+trainer: score_distillation
+
+# ---- latent 形状 [B, F_latent, C, H_latent, W_latent] (480x832 -> 60x104, /8 空间) ----
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+model_kwargs:
+  timestep_shift: 3.0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT

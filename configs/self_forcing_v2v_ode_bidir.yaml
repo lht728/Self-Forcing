@@ -1,0 +1,72 @@
+# Stage-1 (双向/不因果): ODE 回归, 复用路线B 双向 Bernini teacher 离线采样的同一 LMDB。
+# 与因果版 self_forcing_v2v_ode_routeb.yaml 唯一区别: generator 走双向(非因果)路径。
+# 因果版与本双向版互不影响, 可在不同 GPU 同时跑。
+
+init_method: ode
+ode_teacher_type: bidirectional
+
+trainer: ode
+distribution_loss: ode
+
+# ---- 模型 / 初始化 (路线B: Bernini 原生前缀 token v2v 16 通道权重直接初始化双向 generator) ----
+generator_ckpt: checkpoints/bernini_v2v_prefix_init.pt
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+# ---- 不因果化: 双向 generator ----
+generator_causal: false
+causal: false
+
+# ---- v2v (源前缀 token 注入, 不扩通道) ----
+v2v: true
+
+# ---- ODE 数据(LMDB): 复用路线B 双向 teacher 采样的 2000 步 LMDB(含 cond_latent) ----
+data_path: ode_data/bernini_v2v_ode_routeb_lmdb
+max_pair: 100000000
+
+# ---- 4 步去噪 ----
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_train_timestep: 1000
+timestep_shift: 3.0
+guidance_scale: 6.0          # 对齐离线 ODE teacher 采样 CFG 强度
+denoising_loss_type: flow
+mixed_precision: true
+# 双向整段同 timestep, num_frame_per_block 对 uniform timestep 无影响
+num_frame_per_block: 21
+num_training_frames: 21
+
+# ---- 优化 ----
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+total_batch_size: 8          # 必须 == batch_size × GPU数(ODE trainer 强校验); 8卡=8
+
+log_iters: 200
+gc_interval: 100
+gradient_checkpointing: true
+enable_tensorboard: true
+tensorboard_dir: logs/bernini_v2v_ode_bidir/tensorboard
+seed: 0
+
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+model_kwargs:
+  timestep_shift: 3.0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT

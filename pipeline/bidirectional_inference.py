@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -30,32 +30,48 @@ class BidirectionalInferencePipeline(torch.nn.Module):
             timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
-    def inference(self, noise: torch.Tensor, text_prompts: List[str]) -> torch.Tensor:
+    def inference(
+        self,
+        noise: torch.Tensor,
+        text_prompts: List[str],
+        initial_latent: Optional[torch.Tensor] = None,
+        return_latents: bool = False,
+        profile: bool = False,
+        low_memory: bool = False,
+        cond_latent: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Perform inference on the given noise and text prompts.
+        双向(非因果) few-step 推理。与 CausalInferencePipeline.inference 接口对齐
+        (供 inference.py 复用)。v2v 时把源 latent 作前缀 token(source_id=1)整段注入,
+        与训练态一致(无 KV cache, 整段双向去噪)。
         Inputs:
-            noise (torch.Tensor): The input noise tensor of shape
-                (batch_size, num_frames, num_channels, height, width).
-            text_prompts (List[str]): The list of text prompts.
+            noise (torch.Tensor): [B, F, C, H, W] 初始噪声。
+            text_prompts (List[str]): 文本提示。
+            cond_latent (torch.Tensor, optional): v2v 源视频 latent [B, F, C, H, W]。
         Outputs:
-            video (torch.Tensor): The generated video tensor of shape
-                (batch_size, num_frames, num_channels, height, width). It is normalized to be in the range [0, 1].
+            video [B, F, C, H, W] 归一化到 [0,1]; return_latents 时额外返回 pred latent。
         """
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
+        if cond_latent is not None:
+            conditional_dict = {**conditional_dict, "cond_latent": cond_latent}
 
         # initial point
         noisy_image_or_video = noise
+        pred_image_or_video = noise
 
-        # use the last n-1 timesteps to simulate the generator's input
-        for index, current_timestep in enumerate(self.denoising_step_list[:-1]):
+        # 逐步去噪: 每步预测 x0, 再加噪到下一 timestep(最后一步即输出)
+        for index, current_timestep in enumerate(self.denoising_step_list):
             _, pred_image_or_video = self.generator(
                 noisy_image_or_video=noisy_image_or_video,
                 conditional_dict=conditional_dict,
                 timestep=torch.ones(
                     noise.shape[:2], dtype=torch.long, device=noise.device) * current_timestep
             )  # [B, F, C, H, W]
+
+            if index == len(self.denoising_step_list) - 1:
+                break
 
             next_timestep = self.denoising_step_list[index + 1] * torch.ones(
                 noise.shape[:2], dtype=torch.long, device=noise.device)
@@ -68,4 +84,6 @@ class BidirectionalInferencePipeline(torch.nn.Module):
 
         video = self.vae.decode_to_pixel(pred_image_or_video)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+        if return_latents:
+            return video, pred_image_or_video
         return video

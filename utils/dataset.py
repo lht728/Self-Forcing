@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import lmdb
 import json
+import hashlib
+import pickle
 from pathlib import Path
 from PIL import Image
 import os
@@ -249,7 +251,9 @@ class V2VVideoDataset(Dataset):
         src_key: str = "src_video",
         target_fps: int = 16,
         max_pair: int = int(1e8),
+        fit_mode: str = "crop",
     ):
+        assert fit_mode in ("crop", "pad"), f"fit_mode 必须是 crop/pad, 收到 {fit_mode}"
         self.base_video_folder = base_video_folder
         self.num_frames = num_frames
         self.height = height
@@ -257,6 +261,9 @@ class V2VVideoDataset(Dataset):
         self.prompt_key = prompt_key
         self.src_key = src_key
         self.target_fps = target_fps
+        # crop: 等比缩放覆盖目标框后居中裁剪(训练默认, 与既有 checkpoint 对齐, 无黑边但会丢边缘内容)
+        # pad:  等比缩放完整落入目标框后黑边填充(推理可选, 不丢任何源内容, 但引入黑边)
+        self.fit_mode = fit_mode
 
         # data_path 支持单个 *.json 或包含多个 *_data_configs.json 的目录(混合任务)
         json_files = []
@@ -276,6 +283,7 @@ class V2VVideoDataset(Dataset):
         else:
             json_files = [data_path]
 
+        self._json_files = json_files
         self.items = []
         for jf in json_files:
             with open(jf, "r", encoding="utf-8") as f:
@@ -286,12 +294,77 @@ class V2VVideoDataset(Dataset):
                 if d.get(self.src_key) and d.get(self.prompt_key):
                     self.items.append(d)
 
+        # ReCo-Data 常为部分下载: 按磁盘实际存在过滤源视频, 避免 decord 读不存在文件刷屏报错
+        self.items = self._filter_existing(self.items, self.src_key, "V2VVideoDataset] 源视频")
+
         self.items = self.items[:max_pair]
         if len(self.items) == 0:
             raise RuntimeError(
-                f"V2VVideoDataset: 在 {data_path} 未找到有效样本"
-                f"(需要字段 '{self.src_key}' 与 '{self.prompt_key}')"
+                f"V2VVideoDataset: 在 {data_path} 未找到磁盘上存在的有效样本"
+                f"(需要字段 '{self.src_key}'/'{self.prompt_key}' 且源视频文件存在)"
             )
+
+    _dir_cache = {}
+
+    @classmethod
+    def _file_exists(cls, path):
+        """按目录缓存 listdir 做存在性判断(cephfs 上比逐个 os.path.exists 快很多)。"""
+        d = os.path.dirname(path)
+        names = cls._dir_cache.get(d)
+        if names is None:
+            try:
+                names = set(os.listdir(d))
+            except OSError:
+                names = set()
+            cls._dir_cache[d] = names
+        return os.path.basename(path) in names
+
+    def _existence_cache_path(self, key):
+        """按 json 内容指纹 + base_video_folder + 字段名 生成持久化缓存路径。"""
+        h = hashlib.md5()
+        h.update(self.base_video_folder.encode())
+        h.update(key.encode())
+        for jf in sorted(self._json_files):
+            h.update(jf.encode())
+            try:
+                st = os.stat(jf)
+                h.update(f"{st.st_mtime_ns}:{st.st_size}".encode())
+            except OSError:
+                pass
+        cache_dir = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cache", "v2v_existence"))
+        return os.path.join(cache_dir, h.hexdigest() + ".pkl")
+
+    def _filter_existing(self, items, key, tag):
+        """对 items[key] 指向的视频做磁盘存在性过滤, 命中持久化缓存则跳过全部 listdir。"""
+        n_before = len(items)
+        cache_path = self._existence_cache_path(key)
+        if os.environ.get("V2V_REFILTER") != "1":
+            try:
+                with open(cache_path, "rb") as f:
+                    existing = pickle.load(f)
+                items = [d for d in items if d.get(key) and d[key] in existing]
+                print(f"[{tag}存在性过滤(缓存命中): {n_before} -> {len(items)}")
+                return items
+            except (OSError, pickle.PickleError, EOFError):
+                pass
+
+        existing, filtered = set(), []
+        for d in items:
+            rel = d.get(key)
+            if rel and self._file_exists(os.path.join(self.base_video_folder, rel)):
+                existing.add(rel)
+                filtered.append(d)
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tmp = f"{cache_path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(existing, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+        print(f"[{tag}存在性过滤: {n_before} -> {len(filtered)} (已写缓存)")
+        return filtered
 
     def __len__(self):
         return len(self.items)
@@ -309,11 +382,35 @@ class V2VVideoDataset(Dataset):
     def _load_video(self, path):
         import decord
 
-        vr = decord.VideoReader(path, width=self.width, height=self.height)
+        # 先探测源分辨率, 避免 decord 按 width/height 强行非等比拉伸(竖屏素材会被压成"胖人")
+        src_h, src_w = decord.VideoReader(path)[0].shape[:2]
+        if self.fit_mode == "pad":
+            scale = min(self.width / src_w, self.height / src_h)  # 完整落入目标框, 不丢内容
+        else:
+            scale = max(self.width / src_w, self.height / src_h)  # 覆盖目标框, 居中裁剪多余部分
+        new_w = min(self.width, max(1, round(src_w * scale))) if self.fit_mode == "pad" \
+            else max(self.width, round(src_w * scale))
+        new_h = min(self.height, max(1, round(src_h * scale))) if self.fit_mode == "pad" \
+            else max(self.height, round(src_h * scale))
+
+        vr = decord.VideoReader(path, width=new_w, height=new_h)
         indices = self._sample_indices(len(vr), vr.get_avg_fps())
-        frames = vr.get_batch(list(indices)).asnumpy()  # [F, H, W, C] uint8
+        frames = vr.get_batch(list(indices)).asnumpy()  # [F, new_h, new_w, C] uint8
+
+        if self.fit_mode == "pad":
+            # 四周黑边填充到目标尺寸, 源内容完整保留(记录 pad_box 供推理还原时裁掉黑边)
+            canvas = np.zeros((frames.shape[0], self.height, self.width, 3), dtype=frames.dtype)
+            top, left = (self.height - new_h) // 2, (self.width - new_w) // 2
+            canvas[:, top:top + new_h, left:left + new_w, :] = frames
+            frames = canvas
+            pad_box = (top, left, new_h, new_w)
+        else:
+            top, left = (new_h - self.height) // 2, (new_w - self.width) // 2
+            frames = frames[:, top:top + self.height, left:left + self.width, :]
+            pad_box = None
+
         video = torch.from_numpy(frames).float().div_(255.0).mul_(2.0).sub_(1.0)
-        return video.permute(3, 0, 1, 2).contiguous()  # [C, F, H, W]
+        return video.permute(3, 0, 1, 2).contiguous(), pad_box  # [C, F, H, W], pad_box|None
 
     def __getitem__(self, idx):
         # 读视频失败时顺延到下一个样本，避免污染训练
@@ -321,16 +418,19 @@ class V2VVideoDataset(Dataset):
             item = self.items[(idx + offset) % len(self.items)]
             src_path = os.path.join(self.base_video_folder, item[self.src_key])
             try:
-                src_video = self._load_video(src_path)
+                src_video, pad_box = self._load_video(src_path)
             except Exception as e:  # noqa: BLE001
                 if offset == 0:
                     print(f"[V2VVideoDataset] 读取失败 {src_path}: {e}，顺延样本")
                 continue
-            return {
+            out = {
                 "prompts": item[self.prompt_key],
                 "src_video": src_video,
                 "idx": idx,
             }
+            if pad_box is not None:
+                out["pad_box"] = pad_box
+            return out
         raise RuntimeError("V2VVideoDataset: 连续读取视频失败")
 
 
@@ -347,10 +447,11 @@ class V2VPairedVideoDataset(V2VVideoDataset):
     def __init__(self, *args, tar_key: str = "tar_video", **kwargs):
         self.tar_key = tar_key
         super().__init__(*args, **kwargs)
-        self.items = [d for d in self.items if d.get(self.tar_key)]
+        # teacher 短训需配对: 目标视频也必须在磁盘上存在(ReCo-Data 部分下载, tar 同样可能缺失)
+        self.items = self._filter_existing(self.items, self.tar_key, "V2VPairedVideoDataset] 目标视频")
         if len(self.items) == 0:
             raise RuntimeError(
-                f"V2VPairedVideoDataset: 未找到含 '{self.tar_key}' 的样本")
+                f"V2VPairedVideoDataset: 未找到 src+tar 均在磁盘上存在的配对样本")
 
     def __getitem__(self, idx):
         for offset in range(len(self.items)):
@@ -358,8 +459,8 @@ class V2VPairedVideoDataset(V2VVideoDataset):
             src_path = os.path.join(self.base_video_folder, item[self.src_key])
             tar_path = os.path.join(self.base_video_folder, item[self.tar_key])
             try:
-                src_video = self._load_video(src_path)
-                tar_video = self._load_video(tar_path)
+                src_video, _ = self._load_video(src_path)
+                tar_video, _ = self._load_video(tar_path)
             except Exception as e:  # noqa: BLE001
                 if offset == 0:
                     print(f"[V2VPairedVideoDataset] 读取失败 {src_path}: {e}，顺延样本")

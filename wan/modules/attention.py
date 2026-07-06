@@ -10,13 +10,14 @@ try:
         device_name = torch.cuda.get_device_name(0).lower()
         return "h100" in device_name or "hopper" in device_name
     FLASH_ATTN_3_AVAILABLE = is_hopper_gpu()
-except ModuleNotFoundError:
+except (ImportError, OSError):
+    # ImportError 兼容 GLIBC 版本不匹配(本机 glibc<2.32)导致的 .so 加载失败, 回退 SDPA
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, OSError):
     FLASH_ATTN_2_AVAILABLE = False
 
 # FLASH_ATTN_3_AVAILABLE = False
@@ -63,6 +64,19 @@ def flash_attention(
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+
+    # SDPA 回退: 无 flash-attn(本机 glibc<2.32 导致 FA 不可用)时走 PyTorch 原生高效注意力。
+    # 输入 [B, L, N, C] -> [B, N, L, C]; batch=1 且各样本等长, 故忽略 q_lens/k_lens 变长打包。
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        q_s = q.transpose(1, 2).to(dtype)
+        k_s = k.transpose(1, 2).to(dtype)
+        v_s = v.transpose(1, 2).to(dtype)
+        if q_scale is not None:
+            q_s = q_s * q_scale
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_s, k_s, v_s, attn_mask=None, is_causal=causal,
+            dropout_p=dropout_p, scale=softmax_scale)
+        return out.transpose(1, 2).contiguous().type(out_dtype)
 
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)

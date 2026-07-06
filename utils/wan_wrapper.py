@@ -259,9 +259,13 @@ class WanDiffusionWrapper(torch.nn.Module):
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
-        # v2v 通道拼接条件: [B, F, C, H, W] -> [B, C, F, H, W]，作为 model 的 y 在 patch_embedding 前拼接
+        # v2v 前缀 token 条件(方案B): 源 latent [B, F, C, H, W] -> [B, C, F, H, W]
+        # 双向 real/fake score 与因果 generator 的并行训练(_forward_train)都走前缀 token 注入;
+        # 因果 generator 的流式推理(kv_cache 分支)源前缀另由 pipeline 预填进 KV cache(prefill_source),
+        # 故下方仅在非 kv_cache 路径传 cond_latents。
         cond_latent = conditional_dict.get("cond_latent", None)
-        y = cond_latent.permute(0, 2, 1, 3, 4) if cond_latent is not None else None
+        cond_latents = cond_latent.permute(0, 2, 1, 3, 4) if cond_latent is not None else None
+        y = None
 
         # [B, F] -> [B]
         if self.uniform_timestep:
@@ -310,7 +314,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
                         seq_len=self.seq_len,
-                        y=y
+                        y=y,
+                        cond_latents=cond_latents
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(
@@ -323,6 +328,35 @@ class WanDiffusionWrapper(torch.nn.Module):
             return flow_pred, pred_x0, logits
 
         return flow_pred, pred_x0
+
+    def prefill_source(
+        self,
+        source_latent: torch.Tensor,
+        conditional_dict: dict,
+        kv_cache: List[dict],
+        crossattn_cache: List[dict],
+        current_start: int = 0,
+    ) -> None:
+        """方案B: 把整段源视频 latent 作为前缀(source_id=1)预填进因果 generator 的 KV cache。
+
+        源视频在编辑时完整已知, 作 clean(timestep=0) 前缀写入 cache 最前部(sink 区),
+        后续因果生成的每帧通过因果注意力天然 attend 到该前缀。需在 AR 循环前调用一次。
+        """
+        self.model.num_source_frames = source_latent.shape[1]
+        bsz, f_src = source_latent.shape[:2]
+        t = torch.zeros([bsz, f_src], device=source_latent.device, dtype=torch.int64)
+        with torch.no_grad():
+            self.model(
+                source_latent.permute(0, 2, 1, 3, 4),
+                t=t,
+                context=conditional_dict["prompt_embeds"],
+                seq_len=self.seq_len,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start,
+                cache_start=current_start,
+                source_id=1,
+            )
 
     def get_scheduler(self) -> SchedulerInterface:
         """

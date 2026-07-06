@@ -54,22 +54,43 @@ class Trainer:
             )
 
         self.output_path = config.logdir
+        self.tensorboard_writer = None
+        if self.is_main_process and getattr(config, "enable_tensorboard", False):
+            from torch.utils.tensorboard import SummaryWriter
+
+            tensorboard_dir = getattr(config, "tensorboard_dir", None) or os.path.join(self.output_path, "tensorboard")
+            self.tensorboard_writer = SummaryWriter(tensorboard_dir)
+            self.tensorboard_writer.add_text("config", f"```yaml\n{OmegaConf.to_yaml(config)}\n```", 0)
+            if getattr(config, "guidance_scale", None) is not None:
+                # ODE 回归使用离线 CFG teacher 轨迹；这里把采样 CFG 强度写入本地日志，避免训练记录丢失。
+                self.tensorboard_writer.add_scalar("cfg/guidance_scale", float(config.guidance_scale), 0)
 
         # Step 2: Initialize the model and optimizer
 
         assert config.distribution_loss == "ode", "Only ODE loss is supported for ODE training"
         self.model = ODERegression(config, device=self.device)
 
-        # v2v: 扩 patch_embedding 通道, 与 DMD 阶段保持一致的通道拼接条件接口
+        # v2v(方案B): in_channels 仍 16, 不扩通道; 源前缀由 prefix token 机制注入。
+        # 因果 generator 的 ODE(_forward_train) 前缀注入已实现(cond_latents -> 源前缀 token),
+        # cond_latent 经 conditional_dict 在 train_one_step 中注入(见下方 Step 2)。
+        # 该 ODE 阶段为可选的双向->因果适配; DMD 默认直接用 Bernini prefix v2v 权重初始化, 不依赖 ODE。
         self.v2v = getattr(config, "v2v", False)
         if self.v2v:
-            self.model.generator.expand_in_channels(16 + getattr(config, "cond_channels", 16))
+            # v2v 续训: 从 checkpoint 暖启动 generator(优化器状态不恢复)
+            if getattr(config, "resume_ckpt", None):
+                print(f"Resuming generator from {config.resume_ckpt}")
+                resume_sd = torch.load(config.resume_ckpt, map_location="cpu")["generator"]
+                self.model.generator.load_state_dict(resume_sd, strict=True)
 
+        # generator_cpu_offload: 因果版(40GB A100)backward 峰值越界 OOM 时开启,
+        # 把 generator 的 params/grads/AdamW 优化器状态常驻 CPU, 显著削减常驻 GPU 显存,
+        # 给 backward 激活峰值腾空间(速度有损, init 阶段可接受)。默认 False。
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
+            wrap_strategy=config.generator_fsdp_wrap_strategy,
+            cpu_offload=getattr(config, "generator_cpu_offload", False)
         )
         self.model.text_encoder = fsdp_wrap(
             self.model.text_encoder,
@@ -96,14 +117,21 @@ class Trainer:
             config.data_path, max_pair=getattr(config, "max_pair", int(1e8)))
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=config.batch_size, sampler=sampler, num_workers=8)
+        # num_workers 写死 8 在 8 卡下 = 64 个 dataloader 子进程, 叠加多训练并发易把主机内存吃爆触发 OOM。
+        # 改为可配置, 默认降到 2; 配合 prefetch_factor 限制每 worker 预取队列, 避免 anon 内存累积。
+        _num_workers = getattr(config, "num_workers", 2)
+        _dl_kwargs = dict(
+            batch_size=config.batch_size, sampler=sampler, num_workers=_num_workers)
+        if _num_workers > 0:
+            _dl_kwargs["prefetch_factor"] = getattr(config, "prefetch_factor", 2)
+            _dl_kwargs["persistent_workers"] = False
+        dataloader = torch.utils.data.DataLoader(dataset, **_dl_kwargs)
         total_batch_size = getattr(config, "total_batch_size", None)
         if total_batch_size is not None:
             assert total_batch_size == config.batch_size * self.world_size, "Gradient accumulation is not supported for ODE training"
         self.dataloader = cycle(dataloader)
 
-        self.step = 0
+        self.step = getattr(config, "ckpt_step", 0)
 
         ##############################################################################################################
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
@@ -120,6 +148,73 @@ class Trainer:
 
         self.max_grad_norm = 10.0
         self.previous_time = None
+
+    def _write_tensorboard_scalars(self, scalars, step=None):
+        if self.tensorboard_writer is None:
+            return
+        step = self.step if step is None else step
+        for key, value in scalars.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().float().item()
+            elif not isinstance(value, (int, float)):
+                continue
+            self.tensorboard_writer.add_scalar(key, value, step)
+        self.tensorboard_writer.flush()
+
+    def _save_background_mask_visualization(self, log_dict, step=None):
+        if not self.is_main_process or not getattr(self.config, "background_preservation_visualize_masks", False):
+            return
+        interval = int(getattr(self.config, "background_preservation_mask_visualize_interval", 200))
+        step = self.step if step is None else step
+        if interval > 0 and step % interval != 0:
+            return
+        required = (
+            "background_preservation_edit_weight",
+            "background_preservation_bg_weight",
+            "background_preservation_diff",
+        )
+        if any(key not in log_dict for key in required):
+            return
+
+        from PIL import Image, ImageDraw, ImageFont
+
+        vis_dir = getattr(self.config, "background_preservation_mask_visualize_dir", None)
+        if not vis_dir:
+            vis_dir = os.path.join(self.output_path, "background_preservation_masks")
+        os.makedirs(vis_dir, exist_ok=True)
+
+        def to_image(tensor, normalize=False):
+            tensor = tensor.detach().float().cpu()
+            frame_idx = tensor.shape[1] // 2
+            image = tensor[0, frame_idx, 0]
+            if normalize:
+                image = (image - image.min()) / (image.max() - image.min()).clamp_min(1e-6)
+            image = image.clamp(0.0, 1.0)
+            image = (image * 255.0).to(torch.uint8).numpy()
+            return Image.fromarray(image, mode="L").resize((416, 240), Image.BILINEAR).convert("RGB")
+
+        panels = [
+            ("edit_weight", to_image(log_dict["background_preservation_edit_weight"])),
+            ("bg_weight", to_image(log_dict["background_preservation_bg_weight"])),
+            ("diff_norm", to_image(log_dict["background_preservation_diff"], normalize=True)),
+        ]
+        title_h = 18
+        width, height = panels[0][1].size
+        canvas = Image.new("RGB", (width * len(panels), height + title_h), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans.ttf", 11)
+        except OSError:
+            font = None
+        for idx, (title, image) in enumerate(panels):
+            x0 = idx * width
+            draw.text((x0 + 4, 3), title, fill=(0, 0, 0), font=font)
+            canvas.paste(image, (x0, title_h))
+        output = os.path.join(vis_dir, f"step_{step:06d}_background_mask.jpg")
+        canvas.save(output, quality=92)
+        print("Background preservation mask saved to", output)
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -161,6 +256,7 @@ class Trainer:
             ode_latent=ode_latent,
             conditional_dict=conditional_dict
         )
+        self._save_background_mask_visualization(log_dict)
 
         unnormalized_loss = log_dict["unnormalized_loss"]
         timestep = log_dict["timestep"]
@@ -183,12 +279,24 @@ class Trainer:
         loss_breakdown = defaultdict(list)
         stats = {}
 
-        for index, t in enumerate(timestep):
+        flat_loss = gathered_unnormalized_loss.flatten()
+        flat_timestep = gathered_timestep.flatten()
+        stats.update({
+            "loss/unnormalized_mean": flat_loss.mean().item(),
+            "loss/unnormalized_std": flat_loss.std(unbiased=False).item(),
+            "loss/unnormalized_min": flat_loss.min().item(),
+            "loss/unnormalized_max": flat_loss.max().item(),
+            "timestep/mean": flat_timestep.float().mean().item(),
+            "timestep/min": flat_timestep.min().item(),
+            "timestep/max": flat_timestep.max().item(),
+        })
+
+        for index, t in enumerate(flat_timestep):
             loss_breakdown[str(int(t.item()) // 250 * 250)].append(
-                unnormalized_loss[index].item())
+                flat_loss[index].item())
 
         for key_t in loss_breakdown.keys():
-            stats["loss_at_time_" + key_t] = sum(loss_breakdown[key_t]) / \
+            stats["loss/by_timestep_bucket_" + key_t] = sum(loss_breakdown[key_t]) / \
                 len(loss_breakdown[key_t])
 
         self.generator_optimizer.zero_grad()
@@ -219,13 +327,29 @@ class Trainer:
             }, step=self.step)
 
         # Step 5: Logging
+        train_stats = {
+            "train/generator_loss": generator_loss.item(),
+            "train/generator_grad_norm": generator_grad_norm.item(),
+            "optim/lr": self.generator_optimizer.param_groups[0]["lr"],
+            "optim/weight_decay": self.generator_optimizer.param_groups[0]["weight_decay"],
+            "cfg/guidance_scale": float(getattr(self.config, "guidance_scale", 0.0)),
+            "runtime/cuda_memory_allocated_gb": torch.cuda.memory_allocated(self.device) / (1024 ** 3),
+            "runtime/cuda_memory_reserved_gb": torch.cuda.memory_reserved(self.device) / (1024 ** 3),
+            "runtime/world_size": self.world_size,
+            "runtime/batch_size_per_gpu": self.config.batch_size,
+            **stats,
+        }
+        if "background_preservation_loss" in log_dict:
+            train_stats.update({
+                "loss/background_preservation": log_dict["background_preservation_loss"].item(),
+                "mask/background_preservation_bg_ratio": log_dict["background_preservation_bg_ratio"].item(),
+                "mask/background_preservation_edit_ratio": log_dict["background_preservation_edit_ratio"].item(),
+            })
+
         if self.is_main_process and not self.disable_wandb:
-            wandb_loss_dict = {
-                "generator_loss": generator_loss.item(),
-                "generator_grad_norm": generator_grad_norm.item(),
-                **stats
-            }
-            wandb.log(wandb_loss_dict, step=self.step)
+            wandb.log(train_stats, step=self.step)
+
+        self._write_tensorboard_scalars(train_stats)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
@@ -233,6 +357,8 @@ class Trainer:
             gc.collect()
 
     def train(self):
+        # 迭代上限 (CausVid ODE init = 3000 iters); 未配置则无限训练直到手动停止
+        max_iter = getattr(self.config, "max_iter", None)
         while True:
             self.train_one_step()
             if (not self.config.no_save) and self.step % self.config.log_iters == 0:
@@ -247,6 +373,18 @@ class Trainer:
                 else:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    self._write_tensorboard_scalars({
+                        "runtime/per_iteration_time": current_time - self.previous_time,
+                    })
                     self.previous_time = current_time
 
             self.step += 1
+
+            # 达到 max_iter 后存最终 checkpoint 并退出
+            if max_iter is not None and self.step > max_iter:
+                if (not self.config.no_save) and (self.step - 1) % self.config.log_iters != 0:
+                    self.save()
+                    torch.cuda.empty_cache()
+                if self.is_main_process:
+                    print(f"Reached max_iter={max_iter}, stopping training.")
+                break

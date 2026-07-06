@@ -67,6 +67,40 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).type_as(x)
 
 
+def build_rope_freqs(grid_sizes, freqs_table, source_ids=None, visual_id_freqs=None):
+    """为 (源前缀 + 目标) 拼接序列逐 token 预计算复数 rope 频率(Bernini source_id 旋转)。
+
+    grid_sizes: List[(f,h,w)] 每个 latent 组(源帧组/目标帧组)。源与目标共享空间位置(各自从 0 帧起算),
+                仅靠 source_id 旋转区分, 与 Bernini 原生 v2v 一致。
+    source_ids: List[int] 每组的 source_id(0=目标, >=1=源)。
+    返回: [S_total, c] 复数张量, c = head_dim/2。
+    """
+    c = freqs_table.shape[1]
+    split = freqs_table.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    out = []
+    for gi, (f, h, w) in enumerate(grid_sizes):
+        fi = torch.cat([
+            split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(f * h * w, -1)
+        if source_ids is not None and visual_id_freqs is not None and source_ids[gi] != 0:
+            fi = fi * visual_id_freqs[source_ids[gi]].view(1, -1).to(fi.device)
+        out.append(fi)
+    return torch.cat(out, dim=0)
+
+
+def rope_apply_flat(x, freqs_complex):
+    """对整段序列应用逐 token 预计算的复数 rope 频率。
+
+    x: [B, S, n, d]; freqs_complex: [S, d/2] 复数。
+    """
+    b, s, n, d = x.shape
+    x_c = torch.view_as_complex(x.to(torch.float64).reshape(b, s, n, -1, 2))
+    out = torch.view_as_real(x_c * freqs_complex.view(1, s, 1, -1)).flatten(3)
+    return out.type_as(x)
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -124,13 +158,14 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, rope_freqs=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            rope_freqs(Tensor, optional): 预计算逐 token 复数 rope(v2v 前缀+source_id 旋转)。
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -143,9 +178,16 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        if rope_freqs is not None:
+            roped_q = rope_apply_flat(q, rope_freqs)
+            roped_k = rope_apply_flat(k, rope_freqs)
+        else:
+            roped_q = rope_apply(q, grid_sizes, freqs)
+            roped_k = rope_apply(k, grid_sizes, freqs)
+
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+            q=roped_q,
+            k=roped_k,
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
@@ -321,6 +363,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        rope_freqs=None,
     ):
         r"""
         Args:
@@ -338,7 +381,7 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x) * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+            freqs, rope_freqs=rope_freqs)
         # with amp.autocast(dtype=torch.float32):
         x = x + y * e[2]
 
@@ -612,6 +655,9 @@ class WanModel(ModelMixin, ConfigMixin):
         ],
             dim=1)
 
+        # Bernini source_id 旋转表(无学习参数): [1024, d/2] 复数, 与 get_1d_rotary_pos_embed(head_dim) 等价
+        self.visual_id_freqs = rope_params(1024, d)
+
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
 
@@ -619,6 +665,8 @@ class WanModel(ModelMixin, ConfigMixin):
         self.init_weights()
 
         self.gradient_checkpointing = False
+        # v2v 前缀 token: 源帧数(0=纯 t2v), 由外部按数据设置
+        self.num_source_frames = 0
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -647,6 +695,7 @@ class WanModel(ModelMixin, ConfigMixin):
         gan_ca_blocks=None,
         clip_fea=None,
         y=None,
+        cond_latents=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -684,12 +733,29 @@ class WanModel(ModelMixin, ConfigMixin):
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
-                      dim=1) for u in x
-        ])
+
+        # ---- v2v 前缀 token: 源 latent patchify 成前缀, source_id=1 旋转区分, 全注意力后只取目标 ----
+        rope_freqs = None
+        prefix_len = 0
+        if cond_latents is not None:
+            src = [self.patch_embedding(u.unsqueeze(0)) for u in cond_latents]
+            src_grid = tuple(int(v) for v in src[0].shape[2:])
+            src = [u.flatten(2).transpose(1, 2) for u in src]
+            prefix_len = src[0].size(1)
+            tgt_grid = tuple(int(v) for v in grid_sizes[0].tolist())
+            x = [torch.cat([s, t], dim=1) for s, t in zip(src, x)]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            x = torch.cat(x)
+            rope_freqs = build_rope_freqs(
+                [src_grid, tgt_grid], self.freqs.to(device),
+                source_ids=[1, 0], visual_id_freqs=self.visual_id_freqs.to(device))
+        else:
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            assert seq_lens.max() <= seq_len
+            x = torch.cat([
+                torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                          dim=1) for u in x
+            ])
 
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
@@ -718,7 +784,8 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            rope_freqs=rope_freqs)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -758,6 +825,10 @@ class WanModel(ModelMixin, ConfigMixin):
                 final_x = cls_pred_branch(torch.cat([final_x, 10 * e[:, None, :]], dim=1).view(final_x.shape[0], -1))
             else:
                 final_x = cls_pred_branch(final_x.view(final_x.shape[0], -1))
+
+        # v2v: 丢弃源前缀 token, 只对目标 token 预测
+        if prefix_len > 0:
+            x = x[:, prefix_len:]
 
         # head
         x = self.head(x, e)

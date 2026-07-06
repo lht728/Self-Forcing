@@ -1,8 +1,14 @@
-# Bernini 1.3B v2v-only 因果 4 步流式蒸馏 (Self-Forcing + DMD)
-# 基于 self_forcing_dmd.yaml，改为 v2v：源视频作为条件，丢弃 GT，teacher=Bernini
+# Bernini 1.3B v2v-only 因果 4 步流式蒸馏 (Self-Forcing + DMD, Stage-2)
+# Stage-1 三选一 (init_method):
+#   ode            → self_forcing_v2v_ode_routeb.yaml         (双向 teacher 采样)
+#   causal_ode     → self_forcing_v2v_causal_ode_routeb.yaml  (因果 AR teacher 采样, Causal Forcing)
+#   causal_cd      → self_forcing_v2v_causal_cd_routeb.yaml   (免采样, Causal Forcing++)
+# Stage-2 共用本 config; generator_ckpt 指向对应 Stage-1 产出; real_score 始终双向 Bernini
 
-# ---- 模型 / 初始化 ----
-generator_ckpt: checkpoints/ode_init_v2v.pt   # v2v 上做过 ODE 初始化的因果学生
+# ---- 模型 / 初始化 (方案B: Bernini 原生前缀 token v2v, 16 通道, 不扩通道) ----
+# 全新起训用: checkpoints/bernini_v2v_ode_routeb_dmdinit1800.pt (仅含 generator, critic 冷启动, step=0)
+# 续训: 指向带 checkpoint_model_<num> 的完整 ckpt -> 自动恢复 generator+critic+EMA+优化器动量, 并从目录名续 step
+generator_ckpt: logs/bernini_v2v_dmd_routeb/checkpoint_model_000750/model.pt   # 从 DMD step750 续训, 见 PREFIX_TOKEN_V2V_HANDOFF.md §17
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
@@ -19,7 +25,7 @@ warp_denoising_step: true
 ts_schedule: false
 num_train_timestep: 1000
 timestep_shift: 3.0          # 对齐 Bernini 1.3B config 的 shift=3.0
-guidance_scale: 3.0
+guidance_scale: 4.0
 denoising_loss_type: flow
 mixed_precision: true
 seed: 0
@@ -43,13 +49,23 @@ width: 832
 load_raw_video: true         # v2v 需要 VAE 在卡上把源视频编码成条件 latent
 
 # ---- v2v 条件 / 防 copy 捷径 ----
-cond_channels: 16            # 源视频 latent 通道数(Wan VAE z_dim=16)，patch_embedding 扩为 16+16=32
-condition_dropout: 0.15      # 以一定概率丢弃源视频条件，把 CFG 蒸进单次前向，防欠编辑
+condition_dropout: 0.00      # 编辑区尚糊/源跟随未牢, 先设低值(§4.5#4: 调高加重源脱离); 稳后再视欠编辑小幅上调
 
-# ---- v2v teacher(通道拼接, 由 tools/train_v2v_teacher.py 短训产出) ----
-# real_score 必须是 v2v 条件版; fake_score 默认用同一 teacher 权重初始化
-real_score_v2v_ckpt: checkpoints/bernini_v2v_teacher.pt
-# fake_score_v2v_ckpt: checkpoints/bernini_v2v_teacher.pt
+# ---- 背景/身份保持: 未编辑区 latent 重建回源 (weight>0 时自动切 V2VPairedVideoDataset 读 tar_video) ----
+# 掩码来自 |tar_latent - src_latent| diff, 与 ODE 阶段共用 utils.loss.background_preservation_loss
+background_preservation_weight: 0.8              # 0=关; 强度, 0.3~1.0 微调; 实测600步后脸部漂移, 从0.5上调
+background_preservation_mask_quantile: 0.92      # diff 前 8% 才判为编辑区(原0.85泄漏到脸部边界), 调高收紧编辑区判定
+background_preservation_dilation: 1              # 关闭空间膨胀(原3会把编辑区边界主动扩散到脸部)
+background_preservation_soft_mask: true          # 软掩码, 边界平滑过渡(比硬 mask 稳)
+background_preservation_soft_temperature: 0.01
+background_preservation_temporal_smoothing: median  # 原 max 是跨帧取并集只会越滚越大, 改 median 防止掩码单调扩张
+background_preservation_temporal_kernel: 3
+background_preservation_edit_ratio_max: 0.35     # 编辑区占比上限收紧(原0.5), 防脸部大面积被划入编辑区
+
+# ---- v2v teacher(方案B: Bernini 原生前缀 token v2v 权重, 由 convert --no_expand 产出) ----
+# real_score(冻结 teacher)/fake_score 均用同一 Bernini v2v 16通道权重初始化
+real_score_v2v_ckpt: checkpoints/bernini_v2v_prefix_init.pt
+# fake_score_v2v_ckpt: checkpoints/bernini_v2v_prefix_init.pt
 
 # ---- 优化 ----
 sharding_strategy: hybrid_full
@@ -59,13 +75,19 @@ beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
+weight_decay: 0.01
 batch_size: 1
 total_batch_size: 64
 dfake_gen_update_ratio: 5
 ema_weight: 0.99
 ema_start_step: 200
 log_iters: 50
+gc_interval: 100
 gradient_checkpointing: true
+
+# ---- 本地日志: tensorboard + CFG 记录 ----
+enable_tensorboard: true
+tensorboard_dir: logs/bernini_v2v_dmd_routeb/tensorboard
 
 # ---- 蒸馏算法 ----
 distribution_loss: dmd

@@ -2,6 +2,8 @@ from wan.modules.attention import attention
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
+    rope_apply_flat,
+    build_rope_freqs,
     WanLayerNorm,
     WAN_CROSSATTENTION_CLASSES,
     rope_params,
@@ -24,7 +26,7 @@ flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
+def causal_rope_apply(x, grid_sizes, freqs, start_frame=0, visual_id=None):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -45,6 +47,10 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
             dim=-1).reshape(seq_len, 1, -1)
+
+        # v2v 源 token: 乘 source_id 旋转(Bernini visual_id_freqs)
+        if visual_id is not None:
+            freqs_i = freqs_i * visual_id.view(1, 1, -1).to(freqs_i.device)
 
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
@@ -92,7 +98,11 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        source_id=0,
+        num_source_frames=0,
+        visual_id_freqs=None,
+        rope_freqs=None
     ):
         r"""
         Args:
@@ -101,6 +111,10 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             block_mask (BlockMask)
+            source_id (int): v2v 源前缀 prefill 时为 1(目标=0)。
+            num_source_frames (int): 源前缀帧数, 用于目标 rope 位置回退对齐源。
+            rope_freqs (Tensor, optional): 训练态 v2v 前缀逐 token 预计算复数 rope(源 source_id=1, 目标=0),
+                提供时走 rope_apply_flat 整段应用, 与双向模型/流式推理位置编码一致。
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -161,8 +175,12 @@ class CausalWanSelfAttention(nn.Module):
                 )[:, :, :-padded_length].transpose(2, 1)
 
             else:
-                roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
-                roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
+                if rope_freqs is not None:
+                    roped_query = rope_apply_flat(q, rope_freqs).type_as(v)
+                    roped_key = rope_apply_flat(k, rope_freqs).type_as(v)
+                else:
+                    roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
+                    roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
 
                 padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
                 padded_roped_query = torch.cat(
@@ -193,10 +211,17 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
+            # v2v: 源前缀用绝对位置 + source_id 旋转; 目标位置回退 num_source_frames 与源对齐(共享空间位置)
+            if source_id != 0:
+                rope_start_frame = current_start_frame
+                visual_id = visual_id_freqs[source_id] if visual_id_freqs is not None else None
+            else:
+                rope_start_frame = current_start_frame - num_source_frames
+                visual_id = None
             roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                q, grid_sizes, freqs, start_frame=rope_start_frame, visual_id=visual_id).type_as(v)
             roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                k, grid_sizes, freqs, start_frame=rope_start_frame, visual_id=visual_id).type_as(v)
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
@@ -293,7 +318,11 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        source_id=0,
+        num_source_frames=0,
+        visual_id_freqs=None,
+        rope_freqs=None
     ):
         r"""
         Args:
@@ -313,7 +342,9 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs, block_mask, kv_cache, current_start, cache_start,
+            source_id=source_id, num_source_frames=num_source_frames, visual_id_freqs=visual_id_freqs,
+            rope_freqs=rope_freqs)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -486,6 +517,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         ],
             dim=1)
 
+        # Bernini source_id 旋转表(无学习参数): [1024, d/2] 复数
+        self.visual_id_freqs = rope_params(1024, d)
+
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
 
@@ -498,6 +532,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         self.num_frame_per_block = 1
         self.independent_first_frame = False
+        # v2v 前缀 token: 源帧数(0=纯 t2v)
+        self.num_source_frames = 0
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -558,6 +594,54 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
         # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
 
+        return block_mask
+
+    @staticmethod
+    def _prepare_prefix_blockwise_causal_attn_mask(
+        device: torch.device | str, num_source_frames: int, num_target_frames: int,
+        frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1
+    ) -> BlockMask:
+        """v2v 前缀 + 目标 的因果注意力 mask。序列布局 [源前缀 | 目标]:
+        - 源前缀 query: 仅在源前缀内部全注意力(给定上下文, 双向);
+        - 目标 query: 全见源前缀(sink 式) + 目标内部 blockwise-causal;
+        与流式推理(源 prefill 进 KV cache, 目标逐块因果 attend)语义一致。
+        """
+        prefix_len = num_source_frames * frame_seqlen
+        target_len = num_target_frames * frame_seqlen
+        total_length = prefix_len + target_len
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        # 目标区每个 token 所属 block 的结束位置(绝对下标, 含前缀偏移)
+        ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        frame_indices = torch.arange(
+            start=prefix_len, end=total_length,
+            step=frame_seqlen * num_frame_per_block, device=device)
+        for tmp in frame_indices:
+            ends[tmp:tmp + frame_seqlen * num_frame_per_block] = tmp + frame_seqlen * num_frame_per_block
+
+        def attention_mask(b, h, q_idx, kv_idx):
+            is_prefix_q = q_idx < prefix_len
+            is_prefix_kv = kv_idx < prefix_len
+            # 源前缀 query: 只看源前缀(内部全注意力)
+            prefix_mask = is_prefix_q & is_prefix_kv
+            # 目标 query: 全见源前缀
+            tgt_see_prefix = (~is_prefix_q) & is_prefix_kv
+            # 目标 query: 目标内部 blockwise-causal(可选 local window)
+            if local_attn_size == -1:
+                tgt_causal = (~is_prefix_q) & (~is_prefix_kv) & (kv_idx < ends[q_idx])
+            else:
+                lo = ends[q_idx] - local_attn_size * frame_seqlen
+                tgt_causal = (~is_prefix_q) & (~is_prefix_kv) & (kv_idx < ends[q_idx]) & (kv_idx >= lo)
+            return prefix_mask | tgt_see_prefix | tgt_causal | (q_idx == kv_idx)
+
+        block_mask = create_block_mask(
+            attention_mask, B=None, H=None,
+            Q_LEN=total_length + padded_length, KV_LEN=total_length + padded_length,
+            _compile=False, device=device)
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f" cache a prefix(v2v) block-wise causal mask: src={num_source_frames}f "
+                  f"tgt={num_target_frames}f block={num_frame_per_block}")
         return block_mask
 
     @staticmethod
@@ -720,7 +804,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        source_id: int = 0
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -801,7 +886,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask
+            block_mask=self.block_mask,
+            source_id=source_id,
+            num_source_frames=self.num_source_frames,
+            visual_id_freqs=self.visual_id_freqs
         )
 
         def create_custom_forward(module):
@@ -850,9 +938,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        cond_latents=None,
     ):
         r"""
         Forward pass through the diffusion model
+
+        cond_latents: v2v 前缀(方案B)[B, C, F_src, H, W]。提供时把源 latent patchify 成前缀 token
+        (source_id=1 旋转), 拼到目标 token 前, 用"源前缀全见 + 目标 blockwise-causal"的因果 mask,
+        前向后剥掉前缀只对目标预测; 与流式推理(prefill 进 KV cache)的位置编码/可见性一致。
+        流式推理路径(_forward_inference)的源前缀仍由 KV cache prefill 注入。
 
         Args:
             x (List[Tensor]):
@@ -880,31 +974,48 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             self.freqs = self.freqs.to(device)
 
         # Construct blockwise causal attn mask
-        if self.block_mask is None:
-            if clean_x is not None:
-                if self.independent_first_frame:
-                    raise NotImplementedError()
+        if cond_latents is not None:
+            # v2v(方案B 因果适配): 源前缀 + 目标 的因果 mask, 按 (源帧数,目标帧数,frame_seqlen,block) 缓存
+            assert clean_x is None, "v2v 前缀注入与 teacher-forcing(clean_x) 暂不支持同时使用"
+            assert not self.independent_first_frame, "v2v 前缀注入暂不支持 independent_first_frame"
+            _frame_seqlen = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
+            _num_src_frames = cond_latents.shape[2]
+            _num_tgt_frames = x.shape[2]
+            _mask_key = (_num_src_frames, _num_tgt_frames, _frame_seqlen, self.num_frame_per_block)
+            if getattr(self, "_prefix_block_mask_key", None) != _mask_key:
+                self._prefix_block_mask = self._prepare_prefix_blockwise_causal_attn_mask(
+                    device, num_source_frames=_num_src_frames, num_target_frames=_num_tgt_frames,
+                    frame_seqlen=_frame_seqlen, num_frame_per_block=self.num_frame_per_block,
+                    local_attn_size=self.local_attn_size)
+                self._prefix_block_mask_key = _mask_key
+            block_mask = self._prefix_block_mask
+        else:
+            if self.block_mask is None:
+                if clean_x is not None:
+                    if self.independent_first_frame:
+                        raise NotImplementedError()
+                    else:
+                        self.block_mask = self._prepare_teacher_forcing_mask(
+                            device, num_frames=x.shape[2],
+                            frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                            num_frame_per_block=self.num_frame_per_block
+                        )
                 else:
-                    self.block_mask = self._prepare_teacher_forcing_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block
-                    )
-            else:
-                if self.independent_first_frame:
-                    self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
-                    )
-                else:
-                    self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
-                    )
+                    if self.independent_first_frame:
+                        self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
+                            device, num_frames=x.shape[2],
+                            frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                            num_frame_per_block=self.num_frame_per_block,
+                            local_attn_size=self.local_attn_size
+                        )
+                    else:
+                        self.block_mask = self._prepare_blockwise_causal_attn_mask(
+                            device, num_frames=x.shape[2],
+                            frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                            num_frame_per_block=self.num_frame_per_block,
+                            local_attn_size=self.local_attn_size
+                        )
+            block_mask = self.block_mask
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -916,12 +1027,28 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
 
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_lens[0] - u.size(1), u.size(2))],
-                      dim=1) for u in x
-        ])
+        # ---- v2v 前缀 token(方案B 因果适配): 源 latent patchify 成前缀, source_id=1 旋转区分 ----
+        prefix_len = 0
+        rope_freqs = None
+        if cond_latents is not None:
+            src = [self.patch_embedding(u.unsqueeze(0)) for u in cond_latents]
+            src_grid = tuple(int(v) for v in src[0].shape[2:])
+            src = [u.flatten(2).transpose(1, 2) for u in src]
+            prefix_len = src[0].size(1)
+            tgt_grid = tuple(int(v) for v in grid_sizes[0].tolist())
+            x = [torch.cat([s, tt], dim=1) for s, tt in zip(src, x)]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            x = torch.cat(x)
+            rope_freqs = build_rope_freqs(
+                [src_grid, tgt_grid], self.freqs.to(device),
+                source_ids=[1, 0], visual_id_freqs=self.visual_id_freqs.to(device))
+        else:
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            assert seq_lens.max() <= seq_len
+            x = torch.cat([
+                torch.cat([u, u.new_zeros(1, seq_lens[0] - u.size(1), u.size(2))],
+                          dim=1) for u in x
+            ])
 
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
@@ -930,6 +1057,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         e0 = self.time_projection(e).unflatten(
             1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
         # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        # v2v 源前缀帧的时间调制用 t=0(clean), 拼到目标 e0 前; head 只对目标取 e(下方剥前缀后)
+        if cond_latents is not None:
+            t_src = torch.zeros(t.shape[0], cond_latents.shape[2], device=t.device, dtype=t.dtype)
+            e_src = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t_src.flatten()).type_as(x))
+            e0_src = self.time_projection(e_src).unflatten(
+                1, (6, self.dim)).unflatten(dim=0, sizes=t_src.shape)
+            e0 = torch.cat([e0_src, e0], dim=1)
 
         # context
         context_lens = None
@@ -971,7 +1107,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask)
+            block_mask=block_mask,
+            rope_freqs=rope_freqs)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -990,6 +1127,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         if clean_x is not None:
             x = x[:, x.shape[1] // 2:]
+
+        # v2v: 丢弃源前缀 token, 只对目标 token 预测
+        if prefix_len > 0:
+            x = x[:, prefix_len:]
 
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))

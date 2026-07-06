@@ -3,3 +3,7 @@ __pycache__
 
 wan_models
 checkpoints
+ode_data
+logs
+videos
+wan_models

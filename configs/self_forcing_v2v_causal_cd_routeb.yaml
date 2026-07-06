@@ -1,0 +1,81 @@
+# Stage-1 初始化方案 B: Causal CD (Causal Forcing++, 在线配对数据, 无需 ODE LMDB)
+# init_method: causal_cd  →  trainer: consistency_distillation
+# 前置 Stage-0: tools/train_causal_v2v_teacher.py (与 causal_ode 共用因果 AR teacher)
+# Stage-2 DMD 仍用双向 Bernini real_score (self_forcing_v2v_dmd.yaml 不变)
+
+init_method: causal_cd
+trainer: consistency_distillation
+distribution_loss: causal_cd
+
+# ---- 模型 / 初始化 ----
+generator_ckpt: checkpoints/bernini_v2v_prefix_init.pt
+teacher_ckpt: checkpoints/bernini_causal_v2v_teacher.pt   # 因果 AR teacher; 缺省则回退 generator_ckpt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+# ---- v2v (源前缀 token + 目标 tar 作 clean_latent) ----
+v2v: true
+load_raw_video: true
+data_path: /apdcephfs/private_huitinglu/ReCo-Data/replace/replace_data_configs.json
+base_video_folder: /apdcephfs/private_huitinglu/ReCo-Data
+prompt_key: instruction_final_refine
+src_key: src_video
+tar_key: tar_video
+num_raw_frames: 81
+target_fps: 16
+height: 480
+width: 832
+
+# ---- Causal CD 超参 ----
+discrete_cd_N: 48
+cd_timestep_shift: 5.0
+guidance_scale: 3.0
+teacher_forcing: false   # v2v 路线B 用 cond_latent 前缀, 与 clean_x TF 互斥
+
+# ---- 4 步因果 (与 DMD 对齐) ----
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_train_timestep: 1000
+timestep_shift: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+causal: true
+num_frame_per_block: 3
+num_training_frames: 21
+
+# ---- 优化 ----
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+total_batch_size: 8
+ema_weight: 0.99
+ema_start_step: 200
+log_iters: 200
+gc_interval: 100
+gradient_checkpointing: true
+seed: 0
+
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+model_kwargs:
+  timestep_shift: 3.0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT

@@ -27,7 +27,10 @@ class BaseModel(nn.Module):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
 
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+        # generator_causal=False 时 generator 走双向(非因果)路径, 用于"不因果化"蒸馏;
+        # 默认 True 保持原因果 generator 行为不变(因果与双向可在不同 GPU 并行)。
+        generator_causal = getattr(args, "generator_causal", True)
+        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=generator_causal)
         self.generator.model.requires_grad_(True)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)

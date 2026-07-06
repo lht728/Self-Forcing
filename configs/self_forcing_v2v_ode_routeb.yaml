@@ -1,0 +1,94 @@
+# Stage-1 初始化方案 A: ODE 回归 (双向 Bernini teacher 离线采样 LMDB)
+# init_method: ode  →  trainer: ode
+# Stage-2 DMD 共用 self_forcing_v2v_dmd.yaml, 仅改 generator_ckpt 指向本阶段产出
+
+init_method: ode
+ode_teacher_type: bidirectional
+
+# Bernini 1.3B v2v 因果学生 ODE 初始化 (路线B: 前缀 token, 16 通道, 不扩通道)
+# 监督数据: tools/generate_v2v_ode_lmdb.py sample --prefix_v2v (不加 --causal_teacher)
+
+trainer: ode
+distribution_loss: ode
+
+# ---- 模型 / 初始化 (路线B: Bernini 原生前缀 token v2v 16 通道权重直接初始化因果 generator) ----
+generator_ckpt: checkpoints/bernini_v2v_prefix_init.pt
+# 续训: 从 step 1600 checkpoint 暖启动 generator + 接续步数(优化器状态不恢复, ODE init 阶段可接受)
+resume_ckpt: logs/bernini_v2v_ode_routeb/checkpoint_model_001600/model.pt
+ckpt_step: 1600
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+# ---- v2v (源前缀 token 注入, 不扩通道) ----
+v2v: true
+
+# ---- 背景保持(抑制源脱离/背景漂移, §4.5 #3): 非编辑区强制贴回源 ----
+background_preservation_weight: 0.5
+background_preservation_mask_quantile: 0.85
+background_preservation_mask_threshold: 0.0
+background_preservation_dilation: 3
+# 背景保持 mask 增强开关（当前已打开；重启训练后生效）
+background_preservation_temporal_smoothing: max   # none|max|median
+background_preservation_temporal_kernel: 3
+background_preservation_soft_mask: true           # true: bg_weight=sigmoid((threshold-diff)/temperature)
+background_preservation_soft_temperature: 0.01
+background_preservation_edit_ratio_min: 0.15      # 限制最小编辑区比例
+background_preservation_edit_ratio_max: 0.35      # 限制最大编辑区比例
+background_preservation_visualize_masks: true
+background_preservation_mask_visualize_interval: 200
+# background_preservation_mask_visualize_dir: logs/bernini_v2v_ode_routeb/background_preservation_masks
+
+# ---- ODE 数据(LMDB): 含 cond_latent, 由 prefix v2v teacher 采样 ----
+data_path: ode_data/bernini_v2v_ode_routeb_lmdb
+max_pair: 100000000
+
+# ---- 4 步因果 ----
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_train_timestep: 1000
+timestep_shift: 3.0
+guidance_scale: 6.0          # 对齐离线 ODE teacher 采样 CFG 强度
+denoising_loss_type: flow
+mixed_precision: true
+causal: true
+num_frame_per_block: 3
+num_training_frames: 21
+
+# ---- 优化 ----
+sharding_strategy: hybrid_full
+# 因果版在 40GB A100 上 step0 backward 峰值越界 OOM(双向版已 ~37GB 濒临上限);
+# 开启 generator 参数/梯度/优化器状态 CPU offload, 削减常驻显存给激活峰值腾空间。
+generator_cpu_offload: false  # 95GB 卡余量充足, 关闭 offload 去掉 CPU<->GPU 搬运以提速
+lr: 5.0e-06                   # 对齐 CausVid ODE init (论文 §5: AdamW, lr=5e-6, 3000 iters)
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.01
+batch_size: 1
+total_batch_size: 8          # 必须 == batch_size × GPU数(ODE trainer 强校验, 不支持梯度累积); 8卡=8
+
+max_iter: 3000               # CausVid ODE init 迭代步数; 到达后存最终 checkpoint 并退出
+log_iters: 200
+gc_interval: 100
+gradient_checkpointing: true
+enable_tensorboard: true
+tensorboard_dir: logs/bernini_v2v_ode_routeb/tensorboard
+seed: 0
+
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+model_kwargs:
+  timestep_shift: 3.0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT

@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 from model.base import SelfForcingModel
+from utils.loss import background_preservation_loss
 
 
 class DMD(SelfForcingModel):
@@ -45,6 +46,24 @@ class DMD(SelfForcingModel):
         self.ts_schedule = getattr(args, "ts_schedule", True)
         self.ts_schedule_max = getattr(args, "ts_schedule_max", False)
         self.min_score_timestep = getattr(args, "min_score_timestep", 0)
+        self.background_preservation_weight = float(getattr(args, "background_preservation_weight", 0.0))
+        self.background_preservation_mask_quantile = float(
+            getattr(args, "background_preservation_mask_quantile", 0.85))
+        self.background_preservation_mask_threshold = float(
+            getattr(args, "background_preservation_mask_threshold", 0.0))
+        self.background_preservation_dilation = int(getattr(args, "background_preservation_dilation", 3))
+        self.background_preservation_temporal_smoothing = getattr(
+            args, "background_preservation_temporal_smoothing", "none")
+        self.background_preservation_temporal_kernel = int(
+            getattr(args, "background_preservation_temporal_kernel", 3))
+        self.background_preservation_soft_mask = bool(
+            getattr(args, "background_preservation_soft_mask", False))
+        self.background_preservation_soft_temperature = float(
+            getattr(args, "background_preservation_soft_temperature", 0.01))
+        self.background_preservation_edit_ratio_min = float(
+            getattr(args, "background_preservation_edit_ratio_min", 0.0))
+        self.background_preservation_edit_ratio_max = float(
+            getattr(args, "background_preservation_edit_ratio_max", 1.0))
 
         if getattr(self.scheduler, "alphas_cumprod", None) is not None:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
@@ -199,7 +218,9 @@ class DMD(SelfForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        preservation_source_latent: torch.Tensor = None,
+        preservation_target_latent: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -231,6 +252,32 @@ class DMD(SelfForcingModel):
             denoised_timestep_from=denoised_timestep_from,
             denoised_timestep_to=denoised_timestep_to
         )
+
+        if (
+            self.background_preservation_weight > 0
+            and preservation_source_latent is not None
+            and preservation_target_latent is not None
+        ):
+            bg_loss, bg_ratio, edit_ratio = background_preservation_loss(
+                pred=pred_image,
+                source=preservation_source_latent,
+                target=preservation_target_latent,
+                mask_quantile=self.background_preservation_mask_quantile,
+                mask_threshold=self.background_preservation_mask_threshold,
+                dilation=self.background_preservation_dilation,
+                temporal_smoothing=self.background_preservation_temporal_smoothing,
+                temporal_kernel=self.background_preservation_temporal_kernel,
+                soft_mask=self.background_preservation_soft_mask,
+                soft_temperature=self.background_preservation_soft_temperature,
+                edit_ratio_min=self.background_preservation_edit_ratio_min,
+                edit_ratio_max=self.background_preservation_edit_ratio_max,
+            )
+            dmd_loss = dmd_loss + self.background_preservation_weight * bg_loss
+            dmd_log_dict.update({
+                "background_preservation_loss": bg_loss.detach(),
+                "background_preservation_bg_ratio": bg_ratio,
+                "background_preservation_edit_ratio": edit_ratio,
+            })
 
         return dmd_loss, dmd_log_dict
 

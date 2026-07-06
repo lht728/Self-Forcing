@@ -4,14 +4,15 @@ import logging
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.dataset import TextDataset
 from utils.dataset import V2VVideoDataset
-from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from utils.dataset import V2VPairedVideoDataset
+from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, fsdp_optim_state_dict, fsdp_load_optim_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
     merge_dict_list
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import CausVid, DMD, SiD
+from model import CausVid, DMD, BidirectionalDMD, SiD
 import torch
 import wandb
 import time
@@ -58,41 +59,50 @@ class Trainer:
 
         self.output_path = config.logdir
 
+        # 本地 tensorboard(可选, enable_tensorboard 开关, 默认关; 与 wandb 互不影响)
+        self.tensorboard_writer = None
+        if self.is_main_process and getattr(config, "enable_tensorboard", False):
+            from torch.utils.tensorboard import SummaryWriter
+            tensorboard_dir = getattr(config, "tensorboard_dir", None) or os.path.join(self.output_path, "tensorboard")
+            self.tensorboard_writer = SummaryWriter(tensorboard_dir)
+            self.tensorboard_writer.add_text("config", f"```yaml\n{OmegaConf.to_yaml(config)}\n```", 0)
+            if getattr(config, "guidance_scale", None) is not None:
+                self.tensorboard_writer.add_scalar("cfg/guidance_scale", float(config.guidance_scale), 0)
+
         # Step 2: Initialize the model and optimizer
         if config.distribution_loss == "causvid":
             self.model = CausVid(config, device=self.device)
         elif config.distribution_loss == "dmd":
             self.model = DMD(config, device=self.device)
+        elif config.distribution_loss == "bidirectional_dmd":
+            self.model = BidirectionalDMD(config, device=self.device)
         elif config.distribution_loss == "sid":
             self.model = SiD(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
 
-        # v2v: 把 student/fake/real 的 patch_embedding 统一扩通道(通道拼接条件注入)
+        # v2v(方案B): 复用 Bernini 原生前缀 token v2v 能力, in_channels 仍 16, 不扩通道。
+        # real_score(teacher,冻结)/fake_score/generator 统一用 Bernini v2v 16通道权重初始化,
+        # 源视频走 source_id 旋转的前缀 token 注入(见 model/causal_model)。
         self.v2v = getattr(config, "v2v", False)
         if self.v2v:
-            total_in = 16 + getattr(config, "cond_channels", 16)
-            self.model.generator.expand_in_channels(total_in)
-            self.model.fake_score.expand_in_channels(total_in)
-            self.model.real_score.expand_in_channels(total_in)
             self.condition_dropout = getattr(config, "condition_dropout", 0.0)
 
-            # 载入通道拼接 v2v teacher(短训产出): real_score 必须是 v2v 条件版, 否则 DMD 梯度无效。
-            # fake_score 同样用 teacher 权重做初始化(更稳的判别器起点)。
+            def _load_prefix_v2v(module, ckpt_path, name):
+                sd = torch.load(ckpt_path, map_location="cpu")
+                sd = sd.get("generator", sd)
+                missing, unexpected = module.model.load_state_dict(sd, strict=False)
+                missing = [m for m in missing if not m.endswith(".freqs") and not m.endswith(".visual_id_freqs")]
+                assert not missing and not unexpected, \
+                    f"{name} 载入 prefix v2v 权重不匹配 missing={missing[:5]} unexpected={unexpected[:5]}"
+                if self.is_main_process:
+                    print(f"[v2v] {name} 已载入 Bernini prefix v2v 权重: {ckpt_path}")
+
             teacher_ckpt = getattr(config, "real_score_v2v_ckpt", None)
             if teacher_ckpt:
-                t_sd = torch.load(teacher_ckpt, map_location="cpu")
-                t_sd = t_sd.get("generator", t_sd)
-                rs_missing, rs_unexpected = self.model.real_score.model.load_state_dict(t_sd, strict=False)
-                rs_missing = [m for m in rs_missing if not m.endswith(".freqs")]
-                assert not rs_missing and not rs_unexpected, \
-                    f"real_score 载入 teacher 不匹配 missing={rs_missing[:5]} unexpected={rs_unexpected[:5]}"
+                _load_prefix_v2v(self.model.real_score, teacher_ckpt, "real_score")
                 fake_ckpt = getattr(config, "fake_score_v2v_ckpt", teacher_ckpt)
-                f_sd = torch.load(fake_ckpt, map_location="cpu")
-                f_sd = f_sd.get("generator", f_sd)
-                self.model.fake_score.model.load_state_dict(f_sd, strict=False)
-                if self.is_main_process:
-                    print(f"[v2v] real_score/fake_score 已载入 teacher: {teacher_ckpt}")
+                _load_prefix_v2v(self.model.fake_score, fake_ckpt, "fake_score")
 
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
@@ -150,7 +160,12 @@ class Trainer:
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif getattr(config, "v2v", False):
-            dataset = V2VVideoDataset(
+            use_bg_preservation = (
+                config.distribution_loss in ("dmd", "bidirectional_dmd")
+                and float(getattr(config, "background_preservation_weight", 0.0)) > 0
+            )
+            dataset_cls = V2VPairedVideoDataset if use_bg_preservation else V2VVideoDataset
+            dataset = dataset_cls(
                 config.data_path,
                 base_video_folder=config.base_video_folder,
                 num_frames=getattr(config, "num_raw_frames", 81),
@@ -198,14 +213,51 @@ class Trainer:
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
         if getattr(config, "generator_ckpt", False):
             print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
+            full_state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+            gen_sd = full_state_dict
+            if isinstance(full_state_dict, dict) and "generator" in full_state_dict:
+                gen_sd = full_state_dict["generator"]
+            elif isinstance(full_state_dict, dict) and "model" in full_state_dict:
+                gen_sd = full_state_dict["model"]
+            # v2v(方案B): bernini_v2v_prefix_init.pt 是裸 WanModel 键(无 'model.' 前缀),
+            # 而 generator(WanDiffusionWrapper) 期望 'model.' 前缀; 缺前缀则补上以对齐。
+            if gen_sd and not next(iter(gen_sd)).startswith("model."):
+                gen_sd = {f"model.{k}": v for k, v in gen_sd.items()}
             self.model.generator.load_state_dict(
-                state_dict, strict=True
+                gen_sd, strict=True
             )
+
+            # 续训: checkpoint 含 critic/ema 时一并恢复, 并从目录名续上 step,
+            # 否则判别器(fake_score)、EMA、计步都会从头开始, 浪费已蒸馏进度。
+            if isinstance(full_state_dict, dict) and "critic" in full_state_dict:
+                self.model.fake_score.load_state_dict(full_state_dict["critic"], strict=False)
+                if self.is_main_process:
+                    print("[resume] critic(fake_score) 已从 checkpoint 恢复")
+            if isinstance(full_state_dict, dict) and "generator_ema" in full_state_dict \
+                    and self.generator_ema is not None:
+                self.generator_ema.load_state_dict(full_state_dict["generator_ema"])
+                if self.is_main_process:
+                    print("[resume] generator_ema 已从 checkpoint 恢复")
+            # 无损续训: 恢复优化器动量(AdamW 一阶/二阶矩), 否则续训优化器冷启动会抖动。
+            # 必须所有 rank 同时调用(FSDP 集合通信)。
+            if isinstance(full_state_dict, dict) and "generator_optimizer" in full_state_dict:
+                fsdp_load_optim_state_dict(
+                    self.model.generator, self.generator_optimizer,
+                    full_state_dict["generator_optimizer"])
+                if self.is_main_process:
+                    print("[resume] generator_optimizer 已从 checkpoint 恢复")
+            if isinstance(full_state_dict, dict) and "critic_optimizer" in full_state_dict:
+                fsdp_load_optim_state_dict(
+                    self.model.fake_score, self.critic_optimizer,
+                    full_state_dict["critic_optimizer"])
+                if self.is_main_process:
+                    print("[resume] critic_optimizer 已从 checkpoint 恢复")
+            import re as _re
+            _m = _re.search(r"checkpoint_model_(\d+)", str(config.generator_ckpt))
+            if _m:
+                self.step = int(_m.group(1))
+                if self.is_main_process:
+                    print(f"[resume] 续训起始 step={self.step}")
 
         ##############################################################################################################
 
@@ -217,23 +269,46 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
 
+    def _write_tensorboard_scalars(self, scalars, step=None):
+        if self.tensorboard_writer is None:
+            return
+        step = self.step if step is None else step
+        for key, value in scalars.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().float().item()
+            elif not isinstance(value, (int, float)):
+                continue
+            self.tensorboard_writer.add_scalar(key, value, step)
+        self.tensorboard_writer.flush()
+
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
             self.model.generator)
         critic_state_dict = fsdp_state_dict(
             self.model.fake_score)
+        # 无损续训: 聚合优化器分片状态(全部 rank 参与集合通信, rank0 得到全量)
+        generator_optim_state_dict = fsdp_optim_state_dict(
+            self.model.generator, self.generator_optimizer)
+        critic_optim_state_dict = fsdp_optim_state_dict(
+            self.model.fake_score, self.critic_optimizer)
 
         if self.config.ema_start_step < self.step:
             state_dict = {
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
                 "generator_ema": self.generator_ema.state_dict(),
+                "generator_optimizer": generator_optim_state_dict,
+                "critic_optimizer": critic_optim_state_dict,
             }
         else:
             state_dict = {
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
+                "generator_optimizer": generator_optim_state_dict,
+                "critic_optimizer": critic_optim_state_dict,
             }
 
         if self.is_main_process:
@@ -243,6 +318,22 @@ class Trainer:
                        f"checkpoint_model_{self.step:06d}", "model.pt"))
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
+            # 无损 checkpoint 含 optimizer 体积大(~38G), 自动只保留最近 N 个, 防磁盘写满崩溃。
+            keep_last = getattr(self.config, "checkpoint_keep_last", 3)
+            if keep_last and keep_last > 0:
+                import glob as _glob
+                import re as _re
+                import shutil as _shutil
+                ckpt_dirs = [d for d in _glob.glob(os.path.join(self.output_path, "checkpoint_model_*"))
+                             if os.path.isdir(d)]
+
+                def _step_of(p):
+                    m = _re.search(r"checkpoint_model_(\d+)", p)
+                    return int(m.group(1)) if m else -1
+                ckpt_dirs = sorted(ckpt_dirs, key=_step_of)
+                for old in ckpt_dirs[:-keep_last]:
+                    _shutil.rmtree(old, ignore_errors=True)
+                    print(f"[cleanup] 删除旧 checkpoint(仅保留最近 {keep_last} 个): {old}")
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -282,21 +373,34 @@ class Trainer:
             if self.v2v:
                 src_video = batch["src_video"].to(device=self.device, dtype=self.dtype)
                 cond_latent = self.model.vae.encode_to_latent(src_video).to(self.dtype)
+                target_latent = None
+                if "tar_video" in batch:
+                    tar_video = batch["tar_video"].to(device=self.device, dtype=self.dtype)
+                    target_latent = self.model.vae.encode_to_latent(tar_video).to(self.dtype)
                 # condition dropout: 按样本概率整体置零, 防止 4 步少步生成直接拷贝源(欠编辑)
                 if self.condition_dropout > 0 and torch.rand(1).item() < self.condition_dropout:
                     cond_latent = torch.zeros_like(cond_latent)
                 conditional_dict = {**conditional_dict, "cond_latent": cond_latent}
                 unconditional_dict = {**unconditional_dict, "cond_latent": cond_latent}
+            else:
+                cond_latent = None
+                target_latent = None
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
-            generator_loss, generator_log_dict = self.model.generator_loss(
+            generator_loss_kwargs = dict(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 clean_latent=clean_latent,
-                initial_latent=image_latent if self.config.i2v else None
+                initial_latent=image_latent if self.config.i2v else None,
             )
+            if self.config.distribution_loss in ("dmd", "bidirectional_dmd"):
+                generator_loss_kwargs.update({
+                    "preservation_source_latent": cond_latent,
+                    "preservation_target_latent": target_latent,
+                })
+            generator_loss, generator_log_dict = self.model.generator_loss(**generator_loss_kwargs)
 
             generator_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
@@ -402,13 +506,20 @@ class Trainer:
             if self.is_main_process:
                 wandb_loss_dict = {}
                 if TRAIN_GENERATOR:
-                    wandb_loss_dict.update(
-                        {
-                            "generator_loss": generator_log_dict["generator_loss"].mean().item(),
-                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
-                            "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
-                        }
-                    )
+                    wandb_loss_dict.update({
+                        "generator_loss": generator_log_dict["generator_loss"].mean().item(),
+                        "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
+                        "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
+                    })
+                    if "background_preservation_loss" in generator_log_dict:
+                        wandb_loss_dict.update({
+                            "loss/background_preservation": generator_log_dict[
+                                "background_preservation_loss"].mean().item(),
+                            "mask/background_preservation_bg_ratio": generator_log_dict[
+                                "background_preservation_bg_ratio"].mean().item(),
+                            "mask/background_preservation_edit_ratio": generator_log_dict[
+                                "background_preservation_edit_ratio"].mean().item(),
+                        })
 
                 wandb_loss_dict.update(
                     {
@@ -419,6 +530,10 @@ class Trainer:
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
+
+                tb_dict = dict(wandb_loss_dict)
+                tb_dict["cfg/guidance_scale"] = float(getattr(self.config, "guidance_scale", 0.0))
+                self._write_tensorboard_scalars(tb_dict)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:

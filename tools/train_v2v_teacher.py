@@ -11,6 +11,9 @@
 """
 import argparse
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.distributed as dist
@@ -45,10 +48,15 @@ def main():
     ap.add_argument("--max_steps", type=int, default=4000)
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr_patch_embed", type=float, default=1e-4,
+                    help="patch_embedding(含零初始化源通道)单独大 lr, 强行把信息逼进源通道")
+    ap.add_argument("--condition_dropout", type=float, default=0.1,
+                    help="按概率把源条件整体置零, 让 teacher 也能处理无源输入(DMD 的 CFG 需要)")
     ap.add_argument("--timestep_shift", type=float, default=3.0)
     ap.add_argument("--save_every", type=int, default=1000)
     ap.add_argument("--seq_len", type=int, default=32760)
     ap.add_argument("--grad_ckpt", action="store_true")
+    ap.add_argument("--resume", default="", help="断点续训: 从该 ckpt 恢复 generator+optimizer+step")
     args = ap.parse_args()
 
     rank, world_size, local_rank = maybe_init_dist()
@@ -92,12 +100,36 @@ def main():
         dataset, batch_size=args.batch_size, sampler=sampler,
         shuffle=(sampler is None), num_workers=4, drop_last=True))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
+    # 源通道(patch_embedding)零初始化, 与已训好的噪声通道用同一 lr 会学得极慢(MSE 捷径),
+    # 故 patch_embedding 单独用 10x lr, backbone 用基础 lr。
+    pe_params = list(raw_model.patch_embedding.parameters())
+    pe_ids = {id(p) for p in pe_params}
+    other_params = [p for p in raw_model.parameters() if id(p) not in pe_ids]
+    optimizer = torch.optim.AdamW(
+        [{"params": other_params, "lr": args.lr},
+         {"params": pe_params, "lr": args.lr_patch_embed}],
+        betas=(0.9, 0.95), weight_decay=0.01)
+
+    # 断点续训: 覆盖 generator 权重 + 恢复 optimizer 状态与起始 step
+    start_step = 0
+    if args.resume and os.path.exists(args.resume):
+        ck = torch.load(args.resume, map_location="cpu")
+        raw_model.load_state_dict(ck.get("generator", ck), strict=False)
+        if "optimizer" in ck:
+            optimizer.load_state_dict(ck["optimizer"])
+            for st in optimizer.state.values():
+                for k, v in st.items():
+                    if torch.is_tensor(v):
+                        st[k] = v.to(device)
+        start_step = int(ck.get("step", 0))
+        if is_main:
+            print(f"已从 {args.resume} 续训, start_step={start_step}")
 
     if is_main:
-        print(f"teacher 短训开始: dataset={len(dataset)} world_size={world_size} max_steps={args.max_steps}")
+        print(f"teacher 短训开始: dataset={len(dataset)} world_size={world_size} "
+              f"start_step={start_step} max_steps={args.max_steps}")
 
-    for step in range(args.max_steps):
+    for step in range(start_step, args.max_steps):
         batch = next(dataloader)
         src = batch["src_video"].to(device=device, dtype=dtype)   # [B,C,F,H,W]
         tar = batch["tar_video"].to(device=device, dtype=dtype)
@@ -107,6 +139,10 @@ def main():
             cond_lat = vae.encode_to_latent(src).to(dtype)        # [B,Fl,16,h,w]
             x0 = vae.encode_to_latent(tar).to(dtype)
             text = text_encoder(text_prompts=prompts)["prompt_embeds"]
+
+        # condition dropout: 让 teacher 也学会无源时退化为文本生成(DMD CFG 需要)
+        if args.condition_dropout > 0 and torch.rand(1).item() < args.condition_dropout:
+            cond_lat = torch.zeros_like(cond_lat)
 
         b, fl = x0.shape[:2]
         timestep = torch.randint(0, 1000, (b,), device=device, dtype=torch.long)
@@ -133,16 +169,23 @@ def main():
         optimizer.step()
 
         if is_main and step % 20 == 0:
-            print(f"step {step} loss {loss.item():.4f}")
+            pe_w = raw_model.patch_embedding.weight
+            n_norm = pe_w[:, :16].norm().item()
+            c_norm = pe_w[:, 16:].norm().item()
+            print(f"step {step} loss {loss.item():.4f} "
+                  f"源/噪声范数比 {c_norm / (n_norm + 1e-9):.4f} (源范数 {c_norm:.3f})",
+                  flush=True)
 
         if is_main and (step + 1) % args.save_every == 0:
             os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-            torch.save({"generator": raw_model.state_dict()}, args.out)
+            torch.save({"generator": raw_model.state_dict(),
+                        "optimizer": optimizer.state_dict(), "step": step + 1}, args.out)
             print(f"已保存 teacher: {args.out} (step {step + 1})")
 
     if is_main:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        torch.save({"generator": raw_model.state_dict()}, args.out)
+        torch.save({"generator": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(), "step": args.max_steps}, args.out)
         print(f"训练完成, 已保存 teacher: {args.out}")
 
     if world_size > 1:

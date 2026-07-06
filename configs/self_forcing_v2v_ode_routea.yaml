@@ -1,3 +1,4 @@
+# 废弃
 # Bernini 1.3B v2v 因果学生 ODE 初始化 (CausVid 式回归)
 # 从 base 因果生成器(16通道)起步, Trainer 扩通道为 32; 回归 Bernini teacher 离线生成的 v2v ODE 轨迹
 
@@ -40,7 +41,12 @@ beta1: 0.0
 beta2: 0.999
 weight_decay: 0.01
 batch_size: 1
-total_batch_size: 8
+total_batch_size: 1          # 必须 == batch_size × GPU数(ODE trainer 强校验, 不支持梯度累积); 1×H20 故为 1
+
+# ---- 续训(暖启动) ----
+# 从已扩通道的 checkpoint 暖启动 generator(优化器状态不恢复); 起始 step = ckpt_step
+resume_ckpt: logs/bernini_v2v_ode/checkpoint_model_001400/model.pt
+ckpt_step: 1400
 log_iters: 200
 gc_interval: 100
 gradient_checkpointing: true
